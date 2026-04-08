@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Camera Scene Describer</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #111;
+      --fg: #f5f5f5;
+      --muted: #bdbdbd;
+      --card: #1c1c1e;
+      --accent: #4da3ff;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+    }
+
+    .wrap {
+      padding: 16px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .title {
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .sub {
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    video, canvas {
+      width: 100%;
+      border-radius: 14px;
+      background: #000;
+    }
+
+    canvas {
+      display: none;
+    }
+
+    .card {
+      background: var(--card);
+      border-radius: 14px;
+      padding: 12px;
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 14px;
+      font-size: 14px;
+      font-weight: 600;
+      background: var(--accent);
+      color: white;
+    }
+
+    button.secondary {
+      background: #555;
+    }
+
+    .status {
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .desc {
+      white-space: pre-wrap;
+      line-height: 1.5;
+      font-size: 15px;
+    }
+
+    .history {
+      display: grid;
+      gap: 8px;
+      max-height: 240px;
+      overflow: auto;
+    }
+
+    .history-item {
+      padding: 10px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.06);
+      font-size: 14px;
+      line-height: 1.4;
+    }
+
+    .ts {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div>
+      <div class="title">Camera Scene Describer</div>
+      <div class="sub">擬似リアルタイム説明 / 1秒ごと静止画解析</div>
+    </div>
+
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+
+    <div class="card">
+      <div class="row">
+        <button id="startBtn">開始</button>
+        <button id="singleBtn" class="secondary">1回だけ説明</button>
+        <button id="stopBtn" class="secondary">停止</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="status" id="status">待機中</div>
+      <div class="desc" id="desc">まだ説明はありません。</div>
+    </div>
+
+    <div class="card">
+      <div class="sub">履歴</div>
+      <div class="history" id="history"></div>
+    </div>
+  </div>
+
+  <script>
+    let stream = null;
+    let timerId = null;
+    let busy = false;
+    let latestConfig = {
+      intervalMs: 1000,
+      language: "ja",
+      style: "concise",
+      focus: "overall"
+    };
+
+    const state = {
+      running: false,
+      history: []
+    };
+
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const statusEl = document.getElementById("status");
+    const descEl = document.getElementById("desc");
+    const historyEl = document.getElementById("history");
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function setDescription(text) {
+      descEl.textContent = text || "説明を取得できませんでした。";
+    }
+
+    function renderHistory() {
+      historyEl.innerHTML = "";
+      for (const item of state.history.slice().reverse()) {
+        const div = document.createElement("div");
+        div.className = "history-item";
+        div.innerHTML = `<span class="ts">${escapeHtml(item.time)}</span>${escapeHtml(item.description)}`;
+        historyEl.appendChild(div);
+      }
+    }
+
+    function escapeHtml(str) {
+      return String(str)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    async function ensureCamera() {
+      if (stream) return stream;
+
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "environment"
+          },
+          audio: false
+        });
+        video.srcObject = stream;
+        await video.play();
+        return stream;
+      } catch (err) {
+        console.error(err);
+        throw new Error("camera_permission_or_device_error");
+      }
+    }
+
+    function stopCamera() {
+      if (stream) {
+        for (const track of stream.getTracks()) {
+          track.stop();
+        }
+        stream = null;
+      }
+    }
+
+    function captureFrameBase64() {
+      const w = video.videoWidth || 640;
+      const h = video.videoHeight || 480;
+      canvas.width = w;
+      canvas.height = h;
+
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(video, 0, 0, w, h);
+
+      // 品質は重さとのトレードオフ
+      return canvas.toDataURL("image/jpeg", 0.75);
+    }
+
+    function buildPrompt(config) {
+      const lang = config.language || "ja";
+      const style = config.style || "concise";
+      const focus = config.focus || "overall";
+
+      if (lang === "ja") {
+        return `
+あなたはカメラの現在フレームを簡潔に説明する視覚アシスタントです。
+次の条件で説明してください。
+- 日本語で返答
+- 推測しすぎない
+- 見えているもの中心
+- ${style === "detailed" ? "2〜4文で少し詳しく" : "1〜2文で簡潔に"}
+- 注目点: ${focus}
+
+返答フォーマット:
+{
+  "description": "ユーザー向け説明文"
+}
+`.trim();
+      }
+
+      return `
+Describe the current camera frame.
+- Be concise
+- Avoid overclaiming
+- Focus on visible content
+- Style: ${style}
+- Focus: ${focus}
+
+Return JSON:
+{
+  "description": "..."
+}
+`.trim();
+    }
+
+    async function callVisionModel(imageDataUrl, config) {
+      const prompt = buildPrompt(config);
+
+      // ここが差し替えポイント
+      // 実機で Edge Gallery 側の JS ブリッジ/API 名に合わせて置き換える。
+      //
+      // 例:
+      // - window.aiEdge.runVision(...)
+      // - window.gallery.runModel(...)
+      // - window.runInference(...)
+      //
+      // 今はダミー実装。
+      //
+      // 期待する戻り値:
+      // { description: "机の上にノートPCがあります" }
+
+      if (window.aiEdge && typeof window.aiEdge.runVision === "function") {
+        const result = await window.aiEdge.runVision({
+          image: imageDataUrl,
+          prompt
+        });
+        return normalizeResult(result);
+      }
+
+      if (window.gallery && typeof window.gallery.runModel === "function") {
+        const result = await window.gallery.runModel({
+          mode: "vision",
+          image: imageDataUrl,
+          prompt
+        });
+        return normalizeResult(result);
+      }
+
+      // ダミー
+      return {
+        description: "カメラ画像を取得しました。ここにモデルの説明文が入ります。"
+      };
+    }
+
+    function normalizeResult(result) {
+      if (!result) {
+        return { description: "説明を取得できませんでした。" };
+      }
+
+      if (typeof result === "string") {
+        try {
+          const parsed = JSON.parse(result);
+          return { description: parsed.description || result };
+        } catch {
+          return { description: result };
+        }
+      }
+
+      if (result.description) {
+        return { description: result.description };
+      }
+
+      if (result.text) {
+        return { description: result.text };
+      }
+
+      return { description: JSON.stringify(result) };
+    }
+
+    async function describeOnce(config = latestConfig) {
+      if (busy) return null;
+      busy = true;
+
+      try {
+        setStatus("カメラ準備中...");
+        await ensureCamera();
+
+        setStatus("フレーム取得中...");
+        const imageDataUrl = captureFrameBase64();
+
+        setStatus("説明生成中...");
+        const result = await callVisionModel(imageDataUrl, config);
+
+        const description = result.description || "説明を取得できませんでした。";
+        const item = {
+          time: new Date().toLocaleTimeString(),
+          description
+        };
+
+        state.history.push(item);
+        if (state.history.length > 20) {
+          state.history.shift();
+        }
+
+        setDescription(description);
+        renderHistory();
+        setStatus("更新完了");
+
+        return {
+          status: "ok",
+          description,
+          history: state.history
+        };
+      } catch (err) {
+        console.error(err);
+
+        const isCameraError =
+          err && String(err.message).includes("camera_permission_or_device_error");
+
+        const message = isCameraError
+          ? "カメラ権限がないか、カメラを開けませんでした。"
+          : "説明の生成に失敗しました。";
+
+        setStatus(message);
+        setDescription(message);
+
+        return {
+          status: "error",
+          error: message
+        };
+      } finally {
+        busy = false;
+      }
+    }
+
+    async function startLoop(config = latestConfig) {
+      latestConfig = { ...latestConfig, ...config };
+
+      if (state.running) {
+        return {
+          status: "ok",
+          description: descEl.textContent,
+          history: state.history
+        };
+      }
+
+      state.running = true;
+      await describeOnce(latestConfig);
+
+      timerId = setInterval(() => {
+        if (!busy) {
+          describeOnce(latestConfig);
+        }
+      }, latestConfig.intervalMs || 1000);
+
+      return {
+        status: "ok",
+        description: descEl.textContent,
+        history: state.history
+      };
+    }
+
+    function stopLoop() {
+      state.running = false;
+
+      if (timerId) {
+        clearInterval(timerId);
+        timerId = null;
+      }
+
+      stopCamera();
+      setStatus("停止しました");
+
+      return {
+        status: "ok",
+        description: descEl.textContent,
+        history: state.history
+      };
+    }
+
+    document.getElementById("startBtn").addEventListener("click", async () => {
+      await startLoop(latestConfig);
+    });
+
+    document.getElementById("singleBtn").addEventListener("click", async () => {
+      await describeOnce(latestConfig);
+    });
+
+    document.getElementById("stopBtn").addEventListener("click", () => {
+      stopLoop();
+    });
+
+    async function main() {
+      // AI Edge Gallery 側から data JSON が渡される想定
+      // 実環境で受け取り方が違う場合はここを合わせる
+      let input = {};
+      try {
+        if (window.__SKILL_DATA__) {
+          input = typeof window.__SKILL_DATA__ === "string"
+            ? JSON.parse(window.__SKILL_DATA__)
+            : window.__SKILL_DATA__;
+        } else if (new URLSearchParams(location.search).get("data")) {
+          input = JSON.parse(new URLSearchParams(location.search).get("data"));
+        }
+      } catch (e) {
+        console.warn("failed to parse input data", e);
+      }
+
+      latestConfig = {
+        ...latestConfig,
+        ...input
+      };
+
+      const action = input.action || "start";
+
+      let result;
+      if (action === "start") {
+        result = await startLoop(latestConfig);
+      } else if (action === "single") {
+        result = await describeOnce(latestConfig);
+      } else if (action === "stop") {
+        result = stopLoop();
+      } else {
+        result = {
+          status: "error",
+          error: `unknown action: ${action}`
+        };
+      }
+
+      // 返却ブリッジも実環境依存なので複数候補を置く
+      if (window.aiEdge && typeof window.aiEdge.finish === "function") {
+        window.aiEdge.finish(result);
+      } else if (window.gallery && typeof window.gallery.finish === "function") {
+        window.gallery.finish(result);
+      } else {
+        console.log("SKILL_RESULT", result);
+      }
+    }
+
+    main();
+  </script>
+</body>
+</html>
