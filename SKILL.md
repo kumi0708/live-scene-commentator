@@ -9,6 +9,7 @@ description: Opens the camera and provides pseudo real-time scene descriptions b
 
 This skill opens the camera UI and periodically captures a still image to describe the current scene.
 
+
 ### When to use
 Use this skill when the user says things like:
 - "カメラで今写ってるものを説明して"
